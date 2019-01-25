@@ -16,11 +16,31 @@
 
 package com.o19s.es.ltr.feature.store;
 
-import static org.apache.lucene.util.RamUsageEstimator.NUM_BYTES_ARRAY_HEADER;
-import static org.apache.lucene.util.RamUsageEstimator.NUM_BYTES_OBJECT_HEADER;
-import static org.apache.lucene.util.RamUsageEstimator.NUM_BYTES_OBJECT_REF;
-import static org.elasticsearch.index.query.AbstractQueryBuilder.parseInnerQueryBuilder;
-import static org.elasticsearch.index.query.Rewriteable.rewrite;
+import com.o19s.es.ltr.LtrQueryContext;
+import com.o19s.es.ltr.feature.Feature;
+import com.o19s.es.ltr.feature.FeatureSet;
+import com.o19s.es.template.mustache.MustacheUtils;
+import org.apache.lucene.search.Query;
+import org.apache.lucene.util.Accountable;
+import org.apache.lucene.util.BytesRef;
+import org.apache.lucene.util.RamUsageEstimator;
+import org.elasticsearch.common.ParseField;
+import org.elasticsearch.common.ParsingException;
+import org.elasticsearch.common.Strings;
+import org.elasticsearch.common.bytes.BytesReference;
+import org.elasticsearch.common.io.stream.StreamInput;
+import org.elasticsearch.common.io.stream.StreamOutput;
+import org.elasticsearch.common.xcontent.LoggingDeprecationHandler;
+import org.elasticsearch.common.xcontent.NamedXContentRegistry;
+import org.elasticsearch.common.xcontent.ObjectParser;
+import org.elasticsearch.common.xcontent.XContentBuilder;
+import org.elasticsearch.common.xcontent.XContentFactory;
+import org.elasticsearch.common.xcontent.XContentParser;
+import org.elasticsearch.common.xcontent.XContentType;
+import org.elasticsearch.index.query.QueryShardException;
+import org.elasticsearch.index.query.ScriptQueryBuilder;
+import org.elasticsearch.script.Script;
+import org.elasticsearch.script.ScriptType;
 
 import java.io.IOException;
 import java.util.Collection;
@@ -30,32 +50,9 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.stream.Collectors;
 
-import org.apache.lucene.search.Query;
-import org.apache.lucene.util.Accountable;
-import org.apache.lucene.util.RamUsageEstimator;
-import org.elasticsearch.common.ParseField;
-import org.elasticsearch.common.ParsingException;
-import org.elasticsearch.common.bytes.BytesReference;
-import org.elasticsearch.common.io.stream.StreamInput;
-import org.elasticsearch.common.io.stream.StreamOutput;
-import org.elasticsearch.common.xcontent.NamedXContentRegistry;
-import org.elasticsearch.common.xcontent.ObjectParser;
-import org.elasticsearch.common.xcontent.XContentBuilder;
-import org.elasticsearch.common.xcontent.XContentFactory;
-import org.elasticsearch.common.xcontent.XContentParser;
-import org.elasticsearch.common.xcontent.XContentType;
-import org.elasticsearch.index.query.QueryBuilder;
-import org.elasticsearch.index.query.QueryShardContext;
-import org.elasticsearch.index.query.QueryShardException;
-import org.elasticsearch.index.query.Rewriteable;
-import org.elasticsearch.script.ExecutableScript;
-import org.elasticsearch.script.Script;
-import org.elasticsearch.script.ScriptContext;
-import org.elasticsearch.script.ScriptType;
-
-import com.o19s.es.ltr.feature.Feature;
-import com.o19s.es.ltr.feature.FeatureSet;
-import com.o19s.es.template.mustache.MustacheUtils;
+import static org.apache.lucene.util.RamUsageEstimator.NUM_BYTES_ARRAY_HEADER;
+import static org.apache.lucene.util.RamUsageEstimator.NUM_BYTES_OBJECT_HEADER;
+import static org.apache.lucene.util.RamUsageEstimator.NUM_BYTES_OBJECT_REF;
 
 public class StoredFeature implements Feature, Accountable, StorableElement {
     private static final long BASE_RAM_USED = RamUsageEstimator.shallowSizeOfInstance(StoredFeature.class);
@@ -114,7 +111,7 @@ public class StoredFeature implements Feature, Accountable, StorableElement {
     }
 
     public StoredFeature(String name, List<String> params, String templateLanguage, XContentBuilder template) {
-        this(name, params, templateLanguage, Objects.requireNonNull(template).bytes().utf8ToString(), false);
+        this(name, params, templateLanguage, Strings.toString(Objects.requireNonNull(template)), false);
     }
 
     @Override
@@ -137,7 +134,8 @@ public class StoredFeature implements Feature, Accountable, StorableElement {
         } else {
             builder.field(TEMPLATE.getPreferredName());
             // it's ok to use NamedXContentRegistry.EMPTY because we don't really parse we copy the structure...
-            XContentParser parser = XContentFactory.xContent(template).createParser(NamedXContentRegistry.EMPTY, template);
+            XContentParser parser = XContentFactory.xContent(template).createParser(NamedXContentRegistry.EMPTY,
+                    LoggingDeprecationHandler.INSTANCE, template);
             builder.copyCurrentStructure(parser);
         }
         builder.endObject();
@@ -173,11 +171,13 @@ public class StoredFeature implements Feature, Accountable, StorableElement {
 
     @Override
     public Feature optimize() {
-        switch(templateLanguage) {
+        switch (templateLanguage) {
             case MustacheUtils.TEMPLATE_LANGUAGE:
                 return PrecompiledTemplateFeature.compile(this);
             case PrecompiledExpressionFeature.TEMPLATE_LANGUAGE:
                 return PrecompiledExpressionFeature.compile(this);
+            case ScriptFeature.TEMPLATE_LANGUAGE:
+                return ScriptFeature.compile(this);
             default:
                 return this;
         }
@@ -193,10 +193,11 @@ public class StoredFeature implements Feature, Accountable, StorableElement {
     }
 
     @Override
-    public Query doToQuery(QueryShardContext context, FeatureSet set, Map<String, Object> params) {
+    public Query doToQuery(LtrQueryContext context, FeatureSet set, Map<String, Object> params) {
         List<String> missingParams = queryParams.stream()
-                .filter((x) -> params == null || !params.containsKey(x))
+                .filter((x) -> !params.containsKey(x))
                 .collect(Collectors.toList());
+
         if (!missingParams.isEmpty()) {
             String names = missingParams.stream().collect(Collectors.joining(","));
             throw new IllegalArgumentException("Missing required param(s): [" + names + "]");
@@ -207,29 +208,25 @@ public class StoredFeature implements Feature, Accountable, StorableElement {
         // XXX: we hope that in most case users will use mustache that is embedded in the plugin
         // compiling the template from the script engine may hit a circuit breaker
         // TODO: verify that this actually works, it does not feel right
-        ExecutableScript script = context.getScriptService().compile(new Script(ScriptType.INLINE,
-                templateLanguage, template, params), new ScriptContext<>("search", ExecutableScript.class));
-        Object source = script.run();
-
+        ScriptQueryBuilder builder = new ScriptQueryBuilder(new Script(ScriptType.INLINE, templateLanguage, template, params));
         try {
-            XContentParser parser = createParser(source, context.getXContentRegistry());
-            QueryBuilder queryBuilder = parseInnerQueryBuilder(parser);
-
-            // XXX: QueryShardContext extends QueryRewriteContext (for now)
-            return Rewriteable.rewrite(queryBuilder, context).toQuery(context);
-        } catch (IOException|ParsingException|IllegalArgumentException e) {
+            return builder.toQuery(context.getQueryShardContext());
+        } catch (IOException | ParsingException | IllegalArgumentException e) {
             // wrap common exceptions as well so we can attach the feature's name to the stack
-            throw new QueryShardException(context, "Cannot create query while parsing feature [" + name +"]", e);
+            throw new QueryShardException(context.getQueryShardContext(), "Cannot create query while parsing feature [" + name + "]", e);
         }
     }
 
     private XContentParser createParser(Object source, NamedXContentRegistry registry) throws IOException {
         if (source instanceof String) {
-            return XContentFactory.xContent((String) source).createParser(registry, (String) source);
+            return XContentFactory.xContent((String) source).createParser(registry, LoggingDeprecationHandler.INSTANCE, (String) source);
         } else if (source instanceof BytesReference) {
-            return XContentFactory.xContent((BytesReference) source).createParser(registry, (BytesReference) source);
+            BytesRef ref = ((BytesReference) source).toBytesRef();
+            return XContentFactory.xContent(ref.bytes, ref.offset, ref.length)
+                    .createParser(registry, LoggingDeprecationHandler.INSTANCE,
+                            ref.bytes, ref.offset, ref.length);
         } else if (source instanceof byte[]) {
-            return XContentFactory.xContent((byte[]) source).createParser(registry, (byte[]) source);
+            return XContentFactory.xContent((byte[]) source).createParser(registry, LoggingDeprecationHandler.INSTANCE, (byte[]) source);
         } else {
             throw new IllegalArgumentException("Template engine returned an unsupported object type [" +
                     source.getClass().getCanonicalName() + "]");
@@ -266,14 +263,26 @@ public class StoredFeature implements Feature, Accountable, StorableElement {
 
     @Override
     public boolean equals(Object o) {
-        if (this == o) return true;
-        if (!(o instanceof StoredFeature)) return false;
+        if (this == o) {
+            return true;
+        }
+        if (!(o instanceof StoredFeature)) {
+            return false;
+        }
 
         StoredFeature feature = (StoredFeature) o;
-        if (templateAsString != feature.templateAsString) return false;
-        if (!name.equals(feature.name)) return false;
-        if (!queryParams.equals(feature.queryParams)) return false;
-        if (!templateLanguage.equals(feature.templateLanguage)) return false;
+        if (templateAsString != feature.templateAsString) {
+            return false;
+        }
+        if (!name.equals(feature.name)) {
+            return false;
+        }
+        if (!queryParams.equals(feature.queryParams)) {
+            return false;
+        }
+        if (!templateLanguage.equals(feature.templateLanguage)) {
+            return false;
+        }
         return template.equals(feature.template);
     }
 

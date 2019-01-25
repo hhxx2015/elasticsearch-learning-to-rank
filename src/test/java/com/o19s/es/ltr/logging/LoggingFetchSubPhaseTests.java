@@ -16,6 +16,7 @@
 
 package com.o19s.es.ltr.logging;
 
+import com.o19s.es.ltr.LtrTestUtils;
 import com.o19s.es.ltr.feature.PrebuiltFeature;
 import com.o19s.es.ltr.feature.PrebuiltFeatureSet;
 import com.o19s.es.ltr.feature.PrebuiltLtrModel;
@@ -33,6 +34,7 @@ import org.apache.lucene.index.LeafReaderContext;
 import org.apache.lucene.index.Term;
 import org.apache.lucene.search.BooleanClause;
 import org.apache.lucene.search.BooleanQuery;
+import org.apache.lucene.search.BoostQuery;
 import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.search.MatchAllDocsQuery;
 import org.apache.lucene.search.Query;
@@ -50,6 +52,7 @@ import org.elasticsearch.index.fielddata.plain.SortedNumericDVIndexFieldData;
 import org.elasticsearch.search.SearchHit;
 import org.junit.AfterClass;
 import org.junit.BeforeClass;
+
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -59,6 +62,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 
+import static java.util.Collections.singletonList;
 import static org.elasticsearch.common.lucene.search.function.FieldValueFactorFunction.Modifier.LN2P;
 import static org.elasticsearch.index.fielddata.IndexNumericFieldData.NumericType.FLOAT;
 
@@ -125,17 +129,15 @@ public class LoggingFetchSubPhaseTests extends LuceneTestCase {
             List<Map<String, Object>> log2 = logs.get("logger2");
             if (d.get("text").equals("foo")) {
                 assertEquals(log1.get(0).get("name"), "text_feat");
+                assertTrue(log1.get(0).containsKey("value"));
+                assertTrue((Float) log1.get(0).get("value") > 0F);
                 assertFalse(log2.get(0).containsKey("value"));
-                //assertNotEquals(log2.get(0).v1(), "text_feat");
-                assertTrue((Float)log1.get(0).get("value") > 0F);
             } else {
-//                assertEquals("bar", d.get("text"));
-//
-//
-//                assertTrue(log1.containsKey("text_feat"));
-//                assertTrue(log2.containsKey("text_feat"));
-//                assertTrue(log2.get("text_feat") > 0F);
-//                assertEquals(0F, log1.get("text_feat"), 0F);
+                assertEquals(log1.get(0).get("name"), "text_feat");
+                assertTrue(log1.get(0).containsKey("value"));
+                assertEquals((Float) 0.0F, log1.get(0).get("value"));
+                assertTrue(log2.get(0).containsKey("value"));
+                assertTrue((Float)log2.get(0).get("value") > 0F);
             }
             int bits = (int)(long) d.getField("score").numericValue();
             float rawScore = Float.intBitsToFloat(bits);
@@ -144,6 +146,17 @@ public class LoggingFetchSubPhaseTests extends LuceneTestCase {
             assertEquals((float) expectedScore, (Float)log1.get(1).get("value"), Math.ulp((float)expectedScore));
             assertEquals((float) expectedScore, (Float)log1.get(1).get("value"), Math.ulp((float)expectedScore));
         }
+    }
+
+    public void testBogusQuery() throws IOException {
+        PrebuiltFeatureSet set = new PrebuiltFeatureSet("test",
+                singletonList(new PrebuiltFeature("test", new BoostQuery(new MatchAllDocsQuery(), Float.NaN))));
+        LoggingFetchSubPhase.HitLogConsumer logger1 = new LoggingFetchSubPhase.HitLogConsumer("logger1", set, true);
+        RankerQuery q = RankerQuery.build(new PrebuiltLtrModel("test", LtrTestUtils.buildRandomRanker(set.size()), set));
+        Query lq = q.toLoggerQuery(logger1, true);
+        LoggingFetchSubPhase subPhase = new LoggingFetchSubPhase();
+        SearchHit[] hits = selectRandomHits();
+        expectThrows(LtrLoggingException.class, () -> subPhase.doLog(lq, singletonList(logger1), searcher, hits));
     }
 
     public SearchHit[] selectRandomHits() throws IOException {
@@ -177,7 +190,7 @@ public class LoggingFetchSubPhaseTests extends LuceneTestCase {
         });
         assert hits.size() >= minHits;
         Collections.shuffle(hits, random());
-        return hits.toArray(new SearchHit[hits.size()]);
+        return hits.toArray(new SearchHit[0]);
     }
 
     public static Document buildDoc(String text, float value) throws IOException {

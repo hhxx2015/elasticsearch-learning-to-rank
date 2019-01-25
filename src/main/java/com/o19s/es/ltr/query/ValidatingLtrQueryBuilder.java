@@ -16,6 +16,7 @@
 
 package com.o19s.es.ltr.query;
 
+import com.o19s.es.ltr.LtrQueryContext;
 import com.o19s.es.ltr.feature.Feature;
 import com.o19s.es.ltr.feature.FeatureSet;
 import com.o19s.es.ltr.feature.FeatureValidation;
@@ -59,7 +60,7 @@ public class ValidatingLtrQueryBuilder extends AbstractQueryBuilder<ValidatingLt
 
     public static final String NAME = "validating_ltr_query";
     private static final ParseField VALIDATION = new ParseField("validation");
-    private static ObjectParser<ValidatingLtrQueryBuilder, Void> PARSER = new ObjectParser<>(NAME);
+    private static final ObjectParser<ValidatingLtrQueryBuilder, Void> PARSER = new ObjectParser<>(NAME);
 
     static {
         BiConsumer<ValidatingLtrQueryBuilder, StorableElement> setElem = (b, v) -> {
@@ -158,13 +159,16 @@ public class ValidatingLtrQueryBuilder extends AbstractQueryBuilder<ValidatingLt
     }
 
     @Override
-    protected Query doToQuery(QueryShardContext context) throws IOException {
+    protected Query doToQuery(QueryShardContext queryShardContext) throws IOException {
+        //TODO: should we be passing activeFeatures here?
+        LtrQueryContext context = new LtrQueryContext(queryShardContext);
         if (StoredFeature.TYPE.equals(element.type())) {
             Feature feature = ((StoredFeature) element).optimize();
             if (feature instanceof PrecompiledExpressionFeature) {
                 // Derived features cannot be tested alone
                 return new MatchAllDocsQuery();
             }
+            //TODO: support activeFeatures in Validating queries
             return feature.doToQuery(context, null, validation.getParams());
         } else if (StoredFeatureSet.TYPE.equals(element.type())) {
             FeatureSet set = ((StoredFeatureSet) element).optimize();
@@ -175,7 +179,7 @@ public class ValidatingLtrQueryBuilder extends AbstractQueryBuilder<ValidatingLt
             CompiledLtrModel model = ((StoredLtrModel) element).compile(factory);
             return RankerQuery.build(model, context, validation.getParams());
         } else {
-            throw new QueryShardException(context, "Unknown element type [" + element.type() + "]");
+            throw new QueryShardException(queryShardContext, "Unknown element type [" + element.type() + "]");
         }
     }
 

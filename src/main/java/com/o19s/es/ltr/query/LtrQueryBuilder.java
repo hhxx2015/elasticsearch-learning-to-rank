@@ -21,6 +21,7 @@ import com.o19s.es.ltr.feature.PrebuiltFeature;
 import com.o19s.es.ltr.feature.PrebuiltFeatureSet;
 import com.o19s.es.ltr.feature.PrebuiltLtrModel;
 import com.o19s.es.ltr.ranker.LtrRanker;
+import com.o19s.es.ltr.ranker.ranklib.RankLibScriptEngine;
 import com.o19s.es.ltr.utils.AbstractQueryBuilderUtils;
 import org.apache.lucene.search.Query;
 import org.elasticsearch.common.ParseField;
@@ -36,7 +37,6 @@ import org.elasticsearch.index.query.QueryBuilder;
 import org.elasticsearch.index.query.QueryRewriteContext;
 import org.elasticsearch.index.query.QueryShardContext;
 import org.elasticsearch.index.query.Rewriteable;
-import org.elasticsearch.script.ExecutableScript;
 import org.elasticsearch.script.Script;
 import org.elasticsearch.script.ScriptContext;
 
@@ -124,15 +124,15 @@ public class LtrQueryBuilder extends AbstractQueryBuilder<LtrQueryBuilder> {
 
     @Override
     protected Query doToQuery(QueryShardContext context) throws IOException {
-        List<PrebuiltFeature> features = new ArrayList<PrebuiltFeature>(_features.size());
+        List<PrebuiltFeature> features = new ArrayList<>(_features.size());
         for (QueryBuilder builder : _features) {
             features.add(new PrebuiltFeature(builder.queryName(), builder.toQuery(context)));
         }
         features = Collections.unmodifiableList(features);
 
-        ExecutableScript.Factory factory = context.getScriptService().compile(_rankLibScript, new ScriptContext<>(
-                "executable", ExecutableScript.Factory.class));
-        ExecutableScript executableScript = factory.newInstance(null);
+        RankLibScriptEngine.RankLibModelContainer.Factory factory = context.getScriptService().compile(_rankLibScript, new ScriptContext<>(
+                "ranklib", RankLibScriptEngine.RankLibModelContainer.Factory.class));
+        RankLibScriptEngine.RankLibModelContainer executableScript = factory.newInstance();
         LtrRanker ranker = (LtrRanker) executableScript.run();
 
         PrebuiltFeatureSet featureSet = new PrebuiltFeatureSet(queryName(), features);

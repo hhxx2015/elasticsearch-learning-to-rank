@@ -16,6 +16,27 @@
 
 package com.o19s.es.ltr.feature.store;
 
+import com.o19s.es.ltr.feature.FeatureSet;
+import com.o19s.es.ltr.query.DerivedExpressionQuery;
+import org.apache.lucene.util.LuceneTestCase;
+import org.elasticsearch.common.ParsingException;
+import org.elasticsearch.common.Strings;
+import org.elasticsearch.common.xcontent.LoggingDeprecationHandler;
+import org.elasticsearch.common.xcontent.ToXContent;
+import org.elasticsearch.common.xcontent.XContentBuilder;
+import org.elasticsearch.common.xcontent.XContentFactory;
+import org.elasticsearch.common.xcontent.XContentType;
+import org.elasticsearch.index.query.MatchQueryBuilder;
+
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.function.Consumer;
+
 import static org.apache.lucene.util.TestUtil.randomRealisticUnicodeString;
 import static org.apache.lucene.util.TestUtil.randomSimpleString;
 import static org.elasticsearch.common.xcontent.NamedXContentRegistry.EMPTY;
@@ -24,22 +45,8 @@ import static org.hamcrest.CoreMatchers.allOf;
 import static org.hamcrest.CoreMatchers.containsString;
 import static org.hamcrest.CoreMatchers.equalTo;
 import static org.hamcrest.Matchers.greaterThan;
+import static org.hamcrest.Matchers.instanceOf;
 import static org.hamcrest.Matchers.lessThan;
-
-import java.io.IOException;
-import java.util.ArrayList;
-import java.util.HashSet;
-import java.util.List;
-import java.util.Set;
-import java.util.function.Consumer;
-
-import org.apache.lucene.util.LuceneTestCase;
-import org.elasticsearch.common.ParsingException;
-import org.elasticsearch.common.xcontent.ToXContent;
-import org.elasticsearch.common.xcontent.XContentBuilder;
-import org.elasticsearch.common.xcontent.XContentFactory;
-import org.elasticsearch.common.xcontent.XContentType;
-import org.elasticsearch.index.query.MatchQueryBuilder;
 
 public class StoredFeatureSetParserTests extends LuceneTestCase {
 
@@ -81,7 +88,7 @@ public class StoredFeatureSetParserTests extends LuceneTestCase {
         StoredFeatureSet featureSet = parse(featureSetString);
 
         XContentBuilder builder = XContentFactory.contentBuilder(XContentType.JSON);
-        featureSetString = featureSet.toXContent(builder, ToXContent.EMPTY_PARAMS).bytes().utf8ToString();
+        featureSetString = Strings.toString(featureSet.toXContent(builder, ToXContent.EMPTY_PARAMS));
         StoredFeatureSet featureSetReparsed = parse(featureSetString);
         assertFeatureSet(featureSetReparsed, features);
     }
@@ -95,6 +102,60 @@ public class StoredFeatureSetParserTests extends LuceneTestCase {
         assertThat(expectThrows(ParsingException.class,
                 () -> parse(set)).getMessage(),
                 containsString("feature names must be unique in a set"));
+    }
+
+    public void testExpressionMissingQueryParameter() throws IOException {
+        FeatureSet optimizedFeatureSet = getFeatureSet();
+        assertThat(optimizedFeatureSet.feature(0), instanceOf(PrecompiledExpressionFeature.class));
+        assertThat(expectThrows(IllegalArgumentException.class,
+                () -> optimizedFeatureSet.feature(0).doToQuery(null, optimizedFeatureSet, new HashMap<>())).getMessage(),
+        containsString("Missing required param(s): [param1]"));
+    }
+
+    public void testExpressionInvalidQueryParameter() throws IOException {
+        FeatureSet optimizedFeatureSet = getFeatureSet();
+        assertThat(optimizedFeatureSet.feature(0), instanceOf(PrecompiledExpressionFeature.class));
+        Map<String, Object> params = new HashMap<>();
+        params.put("param1", "NaN");
+        assertThat(expectThrows(IllegalArgumentException.class,
+                () -> optimizedFeatureSet.feature(0).doToQuery(null, optimizedFeatureSet, params)).getMessage(),
+                containsString("parameter: param1 expected to be of type Double"));
+    }
+
+    public void testExpressionIntegerQueryParameter() throws IOException {
+        assertDerivedExpressionQuery(Integer.parseInt("10"));
+    }
+
+    public void testExpressionDoubleQueryParameter() throws IOException {
+        assertDerivedExpressionQuery(Double.parseDouble("10.10"));
+    }
+
+    public void testExpressionShortQueryParameter() throws IOException {
+        assertDerivedExpressionQuery(Short.parseShort("10"));
+    }
+
+    private void assertDerivedExpressionQuery(Object param) throws IOException {
+        FeatureSet optimizedFeatureSet = getFeatureSet();
+        assertThat(optimizedFeatureSet.feature(0), instanceOf(PrecompiledExpressionFeature.class));
+        Map<String, Object> params = new HashMap<>();
+        params.put("param1", param);
+        assertThat(optimizedFeatureSet.feature(0).doToQuery(null, optimizedFeatureSet, params), instanceOf(DerivedExpressionQuery.class));
+    }
+
+
+    private FeatureSet getFeatureSet() throws IOException {
+        String featureString = "{\n" +
+                "\"name\":\"testFeature\"," +
+                "\"params\":[\"param1\"]," +
+                "\"template_language\":\"derived_expression\",\n" +
+                "\"template\":\"log10(param1)" +
+                "\"}";
+        String set = "{\"name\" : \"my_set\",\n" +
+                "\"features\": [\n" +
+                featureString +
+                "]}";
+        StoredFeatureSet featureSet = parse(set);
+        return featureSet.optimize();
     }
 
     public void testParseErrorOnMissingName() throws IOException {
@@ -152,11 +213,13 @@ public class StoredFeatureSetParserTests extends LuceneTestCase {
     }
 
     private static StoredFeatureSet parse(String missingName) throws IOException {
-        return StoredFeatureSet.parse(jsonXContent.createParser(EMPTY, missingName));
+        return StoredFeatureSet.parse(jsonXContent.createParser(EMPTY,
+                LoggingDeprecationHandler.INSTANCE, missingName));
     }
 
     private static StoredFeatureSet parse(String missingName, String defaultName) throws IOException {
-        return StoredFeatureSet.parse(jsonXContent.createParser(EMPTY, missingName), defaultName);
+        return StoredFeatureSet.parse(jsonXContent.createParser(EMPTY,
+                LoggingDeprecationHandler.INSTANCE, missingName), defaultName);
     }
 
     public static StoredFeature buildRandomFeature() throws IOException {
@@ -224,7 +287,8 @@ public class StoredFeatureSetParserTests extends LuceneTestCase {
         Set<String> addedFeatures = new HashSet<>();
         while(nbFeat-->0) {
             String featureString = generateRandomFeature();
-            StoredFeature feature = StoredFeature.parse(jsonXContent.createParser(EMPTY, featureString));
+            StoredFeature feature = StoredFeature.parse(jsonXContent.createParser(EMPTY,
+                    LoggingDeprecationHandler.INSTANCE, featureString));
             if (!addedFeatures.add(feature.name())) {
                 continue;
             }

@@ -16,6 +16,7 @@
 
 package com.o19s.es.ltr.query;
 
+import com.o19s.es.ltr.LtrQueryContext;
 import com.o19s.es.ltr.feature.Feature;
 import com.o19s.es.ltr.feature.FeatureSet;
 import com.o19s.es.ltr.feature.LtrModel;
@@ -23,19 +24,21 @@ import com.o19s.es.ltr.feature.PrebuiltLtrModel;
 import com.o19s.es.ltr.ranker.LogLtrRanker;
 import com.o19s.es.ltr.ranker.LtrRanker;
 import com.o19s.es.ltr.ranker.NullRanker;
+import com.o19s.es.ltr.utils.Suppliers;
 import com.o19s.es.ltr.utils.Suppliers.MutableSupplier;
 import org.apache.lucene.index.IndexReader;
 import org.apache.lucene.index.LeafReaderContext;
 import org.apache.lucene.index.Term;
 import org.apache.lucene.search.ConstantScoreScorer;
 import org.apache.lucene.search.ConstantScoreWeight;
+import org.apache.lucene.search.DisiPriorityQueue;
+import org.apache.lucene.search.DisiWrapper;
 import org.apache.lucene.search.DocIdSetIterator;
 import org.apache.lucene.search.Explanation;
 import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.search.Query;
 import org.apache.lucene.search.Scorer;
 import org.apache.lucene.search.Weight;
-import org.elasticsearch.index.query.QueryShardContext;
 
 import java.io.IOException;
 import java.util.ArrayList;
@@ -72,28 +75,28 @@ public class RankerQuery extends Query {
      * @return the lucene query
      */
     public static RankerQuery build(PrebuiltLtrModel model) {
-        return build(model.ranker(), model.featureSet(), null, Collections.emptyMap());
+        return build(model.ranker(), model.featureSet(), new LtrQueryContext(null, Collections.emptySet()), Collections.emptyMap());
     }
 
     /**
      * Build a RankerQuery.
      *
-     * @param model The model
+     * @param model   The model
      * @param context the context used to parse features into lucene queries
-     * @param params the query params
+     * @param params  the query params
      * @return the lucene query
      */
-    public static RankerQuery build(LtrModel model, QueryShardContext context, Map<String, Object> params) {
+    public static RankerQuery build(LtrModel model, LtrQueryContext context, Map<String, Object> params) {
         return build(model.ranker(), model.featureSet(), context, params);
     }
 
-    private static RankerQuery build(LtrRanker ranker, FeatureSet features, QueryShardContext context, Map<String, Object> params) {
+    private static RankerQuery build(LtrRanker ranker, FeatureSet features, LtrQueryContext context, Map<String, Object> params) {
         List<Query> queries = features.toQueries(context, params);
         return new RankerQuery(queries, features, ranker);
     }
 
     public static RankerQuery buildLogQuery(LogLtrRanker.LogConsumer consumer, FeatureSet features,
-                                            QueryShardContext context, Map<String, Object> params) {
+                                            LtrQueryContext context, Map<String, Object> params) {
         List<Query> queries = features.toQueries(context, params);
         return new RankerQuery(queries, features, new LogLtrRanker(consumer, features.size()));
     }
@@ -118,6 +121,7 @@ public class RankerQuery extends Query {
         return rewritten ? new RankerQuery(rewrittenQueries, features, ranker) : this;
     }
 
+    @SuppressWarnings("EqualsWhichDoesntCheckParameterClass")
     @Override
     public boolean equals(Object obj) {
         // This query should never be cached
@@ -144,7 +148,7 @@ public class RankerQuery extends Query {
 
     @Override
     public String toString(String field) {
-        return "rankerquery:"+field;
+        return "rankerquery:" + field;
     }
 
     /**
@@ -174,22 +178,45 @@ public class RankerQuery extends Query {
                 public Scorer scorer(LeafReaderContext context) throws IOException {
                     return new ConstantScoreScorer(this, score(), DocIdSetIterator.all(context.reader().maxDoc()));
                 }
+
+                @Override
+                public boolean isCacheable(LeafReaderContext ctx) {
+                    return false;
+                }
             };
         }
+
         List<Weight> weights = new ArrayList<>(queries.size());
+        // XXX: this is not thread safe and may run into extremely weird issues
+        // if the searcher uses the parallel collector
+        // Hopefully elastic never runs
+        MutableSupplier<LtrRanker.FeatureVector> vectorSupplier = new Suppliers.FeatureVectorSupplier();
+        FVLtrRankerWrapper ltrRankerWrapper = new FVLtrRankerWrapper(ranker, vectorSupplier);
         for (Query q : queries) {
-            weights.add(searcher.createWeight(q, needsScores, boost));
+            if (q instanceof LtrRewritableQuery) {
+                q = ((LtrRewritableQuery)q).ltrRewrite(vectorSupplier);
+            }
+            weights.add(searcher.createWeight(q, true, boost));
         }
-        return new RankerWeight(weights);
+        return new RankerWeight(this, weights, ltrRankerWrapper, features);
     }
 
-    public class RankerWeight extends Weight {
+    public static class RankerWeight extends Weight {
         private final List<Weight> weights;
+        private final FVLtrRankerWrapper ranker;
+        private final FeatureSet features;
 
-        RankerWeight(List<Weight> weights) {
-            super(RankerQuery.this);
+        RankerWeight(RankerQuery query, List<Weight> weights, FVLtrRankerWrapper ranker, FeatureSet features) {
+            super(query);
             assert weights instanceof RandomAccess;
             this.weights = weights;
+            this.ranker = Objects.requireNonNull(ranker);
+            this.features = Objects.requireNonNull(features);
+        }
+
+        @Override
+        public boolean isCacheable(LeafReaderContext ctx) {
+            return false;
         }
 
         @Override
@@ -208,11 +235,7 @@ public class RankerQuery extends Query {
             for (Weight weight : weights) {
                 ordinal++;
                 final Explanation explain;
-                if (weight instanceof FeatureVectorWeight) {
-                    explain = ((FeatureVectorWeight)weight).explain(context, d, doc);
-                } else {
-                    explain = weight.explain(context, doc);
-                }
+                explain = weight.explain(context, doc);
                 String featureString = "Feature " + Integer.toString(ordinal);
                 if (features.feature(ordinal).name() != null) {
                     featureString += "(" + features.feature(ordinal).name() + ")";
@@ -232,24 +255,19 @@ public class RankerQuery extends Query {
         @Override
         public RankerScorer scorer(LeafReaderContext context) throws IOException {
             List<Scorer> scorers = new ArrayList<>(weights.size());
-            List<DocIdSetIterator> subIterators = new ArrayList<>(weights.size());
-            MutableSupplier<LtrRanker.FeatureVector> vectorSupplier = new MutableSupplier<>();
+            DisiPriorityQueue disiPriorityQueue = new DisiPriorityQueue(weights.size());
             for (Weight weight : weights) {
-                Scorer scorer;
-                if (weight instanceof FeatureVectorWeight) {
-                    scorer = ((FeatureVectorWeight)weight).scorer(context, vectorSupplier);
-                } else {
-                    scorer = weight.scorer(context);
-                }
+                Scorer scorer = weight.scorer(context);
                 if (scorer == null) {
                     scorer = new NoopScorer(this, DocIdSetIterator.empty());
                 }
                 scorers.add(scorer);
-                subIterators.add(scorer.iterator());
+                disiPriorityQueue.add(new DisiWrapper(scorer));
             }
 
-            NaiveDisjunctionDISI rankerIterator = new NaiveDisjunctionDISI(DocIdSetIterator.all(context.reader().maxDoc()), subIterators);
-            return new RankerScorer(scorers, rankerIterator, vectorSupplier);
+            DisjunctionDISI rankerIterator = new DisjunctionDISI(
+                    DocIdSetIterator.all(context.reader().maxDoc()), disiPriorityQueue);
+            return new RankerScorer(scorers, rankerIterator, ranker);
         }
 
         class RankerScorer extends Scorer {
@@ -258,14 +276,15 @@ public class RankerQuery extends Query {
              * to be useful for logging
              */
             private final List<Scorer> scorers;
-            private final NaiveDisjunctionDISI iterator;
-            private final MutableSupplier<LtrRanker.FeatureVector> featureVector;
+            private final DisjunctionDISI iterator;
+            private final FVLtrRankerWrapper ranker;
+            private LtrRanker.FeatureVector fv;
 
-            RankerScorer(List<Scorer> scorers, NaiveDisjunctionDISI iterator, MutableSupplier<LtrRanker.FeatureVector> featureVector) {
+            RankerScorer(List<Scorer> scorers, DisjunctionDISI iterator, FVLtrRankerWrapper ranker) {
                 super(RankerWeight.this);
                 this.scorers = scorers;
                 this.iterator = iterator;
-                this.featureVector = featureVector;
+                this.ranker = ranker;
             }
 
             @Override
@@ -275,9 +294,7 @@ public class RankerQuery extends Query {
 
             @Override
             public float score() throws IOException {
-                LtrRanker.FeatureVector fv = featureVector.get();
                 fv = ranker.newFeatureVector(fv);
-                featureVector.set(fv);
                 int ordinal = -1;
                 // a DisiPriorityQueue could help to avoid
                 // looping on all scorers
@@ -294,10 +311,10 @@ public class RankerQuery extends Query {
                 return ranker.score(fv);
             }
 
-            @Override
-            public int freq() throws IOException {
-                return scorers.size();
-            }
+//            @Override
+//            public int freq() throws IOException {
+//                return scorers.size();
+//            }
 
             @Override
             public DocIdSetIterator iterator() {
@@ -311,15 +328,14 @@ public class RankerQuery extends Query {
      * Mostly needed to avoid calling {@link Scorer#iterator()} to directly advance
      * from {@link RankerWeight.RankerScorer#score()} as some Scorer implementations
      * will instantiate new objects every time iterator() is called.
-     * NOTE: consider using {@link org.apache.lucene.search.DisiPriorityQueue}?
      */
-    static class NaiveDisjunctionDISI extends DocIdSetIterator {
+    static class DisjunctionDISI extends DocIdSetIterator {
         private final DocIdSetIterator main;
-        private final List<DocIdSetIterator> subIterators;
+        private final DisiPriorityQueue subIteratorsPriorityQueue;
 
-        NaiveDisjunctionDISI(DocIdSetIterator main, List<DocIdSetIterator> subIterators) {
+        DisjunctionDISI(DocIdSetIterator main, DisiPriorityQueue subIteratorsPriorityQueue) {
             this.main = main;
-            this.subIterators = subIterators;
+            this.subIteratorsPriorityQueue = subIteratorsPriorityQueue;
         }
 
         @Override
@@ -345,17 +361,57 @@ public class RankerQuery extends Query {
             if (target == NO_MORE_DOCS) {
                 return;
             }
-            for (DocIdSetIterator iterator: subIterators) {
-                // FIXME: Probably inefficient
-                if (iterator.docID() < target) {
-                    iterator.advance(target);
-                }
+            DisiWrapper top = subIteratorsPriorityQueue.top();
+            while (top.doc < target) {
+                top.doc = top.iterator.advance(target);
+                top = subIteratorsPriorityQueue.updateTop();
             }
         }
 
         @Override
         public long cost() {
             return main.cost();
+        }
+    }
+
+    static class FVLtrRankerWrapper implements LtrRanker {
+        private final LtrRanker wrapped;
+        private final MutableSupplier<FeatureVector> vectorSupplier;
+
+        FVLtrRankerWrapper(LtrRanker wrapped, MutableSupplier<FeatureVector> vectorSupplier) {
+            this.wrapped = Objects.requireNonNull(wrapped);
+            this.vectorSupplier = Objects.requireNonNull(vectorSupplier);
+        }
+
+        @Override
+        public String name() {
+            return wrapped.name();
+        }
+
+        @Override
+        public FeatureVector newFeatureVector(FeatureVector reuse) {
+            FeatureVector fv = wrapped.newFeatureVector(reuse);
+            vectorSupplier.set(fv);
+            return fv;
+        }
+
+        @Override
+        public float score(FeatureVector point) {
+            return wrapped.score(point);
+        }
+
+        @Override
+        public boolean equals(Object o) {
+            if (this == o) return true;
+            if (o == null || getClass() != o.getClass()) return false;
+            FVLtrRankerWrapper that = (FVLtrRankerWrapper) o;
+            return Objects.equals(wrapped, that.wrapped) &&
+                    Objects.equals(vectorSupplier, that.vectorSupplier);
+        }
+
+        @Override
+        public int hashCode() {
+            return Objects.hash(wrapped, vectorSupplier);
         }
     }
 }

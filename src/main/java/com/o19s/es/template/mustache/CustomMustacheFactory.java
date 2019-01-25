@@ -27,6 +27,7 @@ import com.github.mustachejava.TemplateContext;
 import com.github.mustachejava.codes.DefaultMustache;
 import com.github.mustachejava.codes.IterableCode;
 import com.github.mustachejava.codes.WriteCode;
+import org.elasticsearch.common.Strings;
 import org.elasticsearch.common.xcontent.XContentBuilder;
 import org.elasticsearch.common.xcontent.XContentType;
 
@@ -188,7 +189,7 @@ public class CustomMustacheFactory extends DefaultMustacheFactory {
 
         ToJsonCode(TemplateContext tc, DefaultMustacheFactory df, Mustache mustache, String variable) {
             super(tc, df, mustache, CODE);
-            if (CODE.equalsIgnoreCase(variable) == false) {
+            if (!CODE.equalsIgnoreCase(variable)) {
                 throw new MustacheException("Mismatch function code [" + CODE + "] cannot be applied to [" + variable + "]");
             }
         }
@@ -215,7 +216,7 @@ public class CustomMustacheFactory extends DefaultMustacheFactory {
                         // Do not handle as JSON
                         return oh.stringify(resolved);
                     }
-                    return builder.string();
+                    return Strings.toString(builder);
                 } catch (IOException e) {
                     throw new MustacheException("Failed to convert object to JSON", e);
                 }

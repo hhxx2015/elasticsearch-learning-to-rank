@@ -19,6 +19,7 @@ package com.o19s.es.ltr.ranker.parser;
 import com.o19s.es.ltr.feature.FeatureSet;
 import com.o19s.es.ltr.ranker.linear.LinearRanker;
 import org.elasticsearch.common.ParsingException;
+import org.elasticsearch.common.xcontent.LoggingDeprecationHandler;
 import org.elasticsearch.common.xcontent.XContentParser;
 import org.elasticsearch.common.xcontent.json.JsonXContent;
 
@@ -27,11 +28,13 @@ import java.io.IOException;
 import static org.elasticsearch.common.xcontent.NamedXContentRegistry.EMPTY;
 
 public class LinearRankerParser implements LtrRankerParser {
-    public static String TYPE = "model/linear";
+    public static final String TYPE = "model/linear";
 
     @Override
     public LinearRanker parse(FeatureSet set, String model) {
-        try (XContentParser parser = JsonXContent.jsonXContent.createParser(EMPTY, model)) {
+        try (XContentParser parser = JsonXContent.jsonXContent.createParser(EMPTY,
+                LoggingDeprecationHandler.INSTANCE, model)
+        ) {
             return parse(parser, set);
         } catch (IOException e) {
             throw new IllegalArgumentException(e.getMessage(), e);

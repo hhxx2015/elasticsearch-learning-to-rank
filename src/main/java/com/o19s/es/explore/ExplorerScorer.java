@@ -15,20 +15,18 @@
  */
 package com.o19s.es.explore;
 
-import org.apache.lucene.index.LeafReaderContext;
 import org.apache.lucene.search.DocIdSetIterator;
 import org.apache.lucene.search.Scorer;
 import org.apache.lucene.search.Weight;
+
 import java.io.IOException;
 
 public class ExplorerScorer extends Scorer {
-    private Scorer subScorer;
-    private String type;
-    private LeafReaderContext context;
+    private final Scorer subScorer;
+    private final String type;
 
-    protected ExplorerScorer(Weight weight, LeafReaderContext context, String type, Scorer subScorer) {
+    protected ExplorerScorer(Weight weight, String type, Scorer subScorer) {
         super(weight);
-        this.context = context;
         this.type = type;
         this.subScorer = subScorer;
     }
@@ -40,16 +38,18 @@ public class ExplorerScorer extends Scorer {
         // Grab freq from subscorer, or the children if available
         if(subScorer.getChildren().size() > 0) {
             for(ChildScorer child : subScorer.getChildren()) {
+                assert child.child instanceof PostingsExplorerQuery.PostingsExplorerScorer;
                 if(child.child.docID() == docID()) {
-                    tf_stats.add(child.child.freq());
+                    tf_stats.add(child.child.score());
                 }
             }
         } else {
+            assert subScorer instanceof PostingsExplorerQuery.PostingsExplorerScorer;
             assert subScorer.docID() == docID();
-            tf_stats.add(subScorer.freq());
+            tf_stats.add(subScorer.score());
         }
 
-        float retval = 0.0f;
+        float retval;
         switch(type) {
             case("sum_raw_tf"):
                 retval = tf_stats.getSum();
@@ -78,10 +78,6 @@ public class ExplorerScorer extends Scorer {
         return subScorer.docID();
     }
 
-    @Override
-    public int freq() throws IOException {
-        return subScorer.freq();
-    }
 
     @Override
     public DocIdSetIterator iterator() {
